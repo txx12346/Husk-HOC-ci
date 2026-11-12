@@ -1,0 +1,157 @@
+﻿diff --git a/scripts/build_angle_ios.sh b/scripts/build_angle_ios.sh
+index 4e337b7..d35f05e 100755
+--- a/scripts/build_angle_ios.sh
++++ b/scripts/build_angle_ios.sh
+@@ -67,8 +67,8 @@ angle_build () {
+         CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+         WK_AVAILABILITY_OVERLAY_FLAGS="" WK_AVAILABILITY_OVERLAY_SWIFT_FLAGS="" \
+         IPHONEOS_DEPLOYMENT_TARGET="15.5" \
+-        OTHER_CFLAGS='$(inherited) -Wno-unguarded-availability-new' \
+-        OTHER_CPLUSPLUSFLAGS='$(inherited) -Wno-unguarded-availability-new' \
++        OTHER_CFLAGS='$(inherited) -Wno-unguarded-availability-new -Wno-thread-safety-attributes -Wno-thread-safety-analysis -Wno-error=thread-safety-attributes -Wno-error=thread-safety-analysis' \
++        OTHER_CPLUSPLUSFLAGS='$(inherited) -Wno-unguarded-availability-new -Wno-thread-safety-attributes -Wno-thread-safety-analysis -Wno-error=thread-safety-attributes -Wno-error=thread-safety-analysis' \
+         ${ldflags[@]+"${ldflags[@]}"} \
+         > "$LOG" 2>&1 \
+       || { echo "ANGLE build failed; last errors:" >&2
+diff --git a/scripts/build_gpu_ios.sh b/scripts/build_gpu_ios.sh
+index f8d2c65..832e757 100755
+--- a/scripts/build_gpu_ios.sh
++++ b/scripts/build_gpu_ios.sh
+@@ -18,18 +18,25 @@ HUSK_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ GPU="$HUSK_ROOT/third_party/gpu"
+ PREFIX="$HUSK_ROOT/build/ios-arm64/sysroot"
+ LOGS="$HUSK_ROOT/build/logs"
+-MESON=/opt/homebrew/bin/meson
+-NINJA=/opt/homebrew/bin/ninja
++MESON="$(command -v meson)"
++NINJA="$(command -v ninja)"
+ mkdir -p "$GPU" "$LOGS"
+ 
+ EPOXY_COMMIT=bf98587477fe68d07b93319ece7b40a7d0e2eabe
+ VIRGL_COMMIT=482f9d8b8c2d2288efa10a027116216909d2c226
+ 
++# Prefer a reachable GitHub front when github.com times out (common on CN nets).
++GITHUB_MIRROR="${GITHUB_MIRROR:-https://ghproxy.net/https://github.com}"
++
+ fetch () {
+     local dir="$1"
+     local url="$2"
+     local commit="$3"
+-    [ -d "$GPU/$dir" ] || git clone -q "$url" "$GPU/$dir"
++    local mirrored="${url/https:\/\/github.com/$GITHUB_MIRROR}"
++    if [ ! -d "$GPU/$dir" ]; then
++        git clone "$mirrored" "$GPU/$dir" \
++          || git clone "$url" "$GPU/$dir"
++    fi
+     ( cd "$GPU/$dir" && git checkout -q "$commit" )
+ }
+ 
+diff --git a/scripts/package_ipa.sh b/scripts/package_ipa.sh
+index da8e595..0f12876 100755
+--- a/scripts/package_ipa.sh
++++ b/scripts/package_ipa.sh
+@@ -63,8 +63,9 @@ fi
+ 
+ echo "==> building"
+ xcodebuild -project "$HUSK_ROOT/src/app/Husk.xcodeproj" -scheme Husk \
+-    -sdk iphoneos -configuration Release -derivedDataPath "$DD" \
++    -sdk iphoneos -destination 'generic/platform=iOS' -configuration Release -derivedDataPath "$DD" \
+     CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
++    ONLY_ACTIVE_ARCH=NO \
+     build 2>&1 | tee "$DD/build.log" | grep -E "error:|BUILD (SUCCEEDED|FAILED)" || true
+ 
+ # A failed build used to sail straight past this: the previous .app is still in
+diff --git a/src/java-framework/src/javax/microedition/khronos/egl/HuskEGL.java b/src/java-framework/src/javax/microedition/khronos/egl/HuskEGL.java
+index 882b906..0137f13 100644
+--- a/src/java-framework/src/javax/microedition/khronos/egl/HuskEGL.java
++++ b/src/java-framework/src/javax/microedition/khronos/egl/HuskEGL.java
+@@ -83,6 +83,9 @@ final class HuskEGL implements EGL11 {
+         if (render()) return SURFACE;
+         android.view.SurfaceView v = viewOf(w);
+         int[] size = v != null ? v.huskSurfaceSize() : new int[] { husk.Native.screenWidth(), husk.Native.screenHeight() };
++        /* Forked GLSurfaceViews (Gameloft) can create the window before layout: never hand EGL a 0x0 pbuffer. */
++        if (size[0] <= 0) size[0] = husk.Native.screenWidth();
++        if (size[1] <= 0) size[1] = husk.Native.screenHeight();
+         long h = husk.EGLNative.createSurface(size[0], size[1]);
+         if (h == 0) { err(EGL_BAD_ALLOC); return EGL_NO_SURFACE; }
+         Surface s = new Surface(); s.handle = h; s.w = size[0]; s.h = size[1]; s.view = v;
+@@ -122,7 +125,13 @@ final class HuskEGL implements EGL11 {
+             try { su.view.getLocationOnScreen(loc); } catch (RuntimeException e) {}
+             x = loc[0]; y = loc[1]; w = su.view.getWidth(); h = su.view.getHeight();
+             if (w <= 0 || h <= 0) { w = su.w; h = su.h; }
++        } else {
++            /* Gameloft's forked GLSurfaceView sometimes creates the window surface before huskView is wired;
++             * still present full-screen so EN_swap / app_frame_draw have a non-zero destination. */
++            w = su.w > 0 ? su.w : husk.Native.screenWidth();
++            h = su.h > 0 ? su.h : husk.Native.screenHeight();
+         }
++        if (w <= 0 || h <= 0) { w = husk.Native.screenWidth(); h = husk.Native.screenHeight(); x = 0; y = 0; }
+         return husk.EGLNative.swap(su.handle, ch, x, y, w, h);
+     }
+     public int eglGetError() { Integer e = sError.get(); sError.set(EGL_SUCCESS); return e == null ? EGL_SUCCESS : e; }
+diff --git a/src/translation-layer-next/husk-tl-dvm-android.c b/src/translation-layer-next/husk-tl-dvm-android.c
+index 952c67c..14459b3 100644
+--- a/src/translation-layer-next/husk-tl-dvm-android.c
++++ b/src/translation-layer-next/husk-tl-dvm-android.c
+@@ -689,6 +689,16 @@ static bool e2_wait_ready(void)
+     return r;
+ }
+ 
++/* Gameloft (Heroes of Order & Chaos / 英雄战歌) and similar: a GLSurfaceView fork in the APK draws on its own
++ * GLThread through HuskEGL. Shared ANGLE textures often stay black on iOS; force CPU readback for those packages. */
++static bool e2_force_readback(void)
++{
++    const char *p = A.pkg;
++    if (!p || !p[0]) return false;
++    return strstr(p, "gameloft") || strstr(p, "Gloft") || strstr(p, "GLOFT")
++        || strstr(p, "GloftHOHM") || getenv("HUSK_EGL_READBACK");
++}
++
+ NAT(EN_createContext)
+ {
+     (void)self;
+@@ -698,15 +708,25 @@ NAT(EN_createContext)
+     int v = a[0].i <= 1 ? 1 : a[0].i >= 3 && E2.es3 ? 3 : 2;
+     app_ctx *share = (app_ctx *)(uintptr_t)a[1].j;
+     app_ctx *c = calloc(1, sizeof(*c));
++    bool force_rb = e2_force_readback();
+     for (int tries = 0; tries < 2 && !c->c; tries++) {
+         const EGLint attr[] = { 0x3098, v, EGL_NONE };
+-        c->c = createContext(E2.dpy, E2.cfg, share && share->c ? share->c : E2.ui, attr);
+-        if (!c->c) { c->c = createContext(E2.dpy, E2.cfg, share && share->c ? share->c : NULL, attr); c->readback = c->c != NULL; }
++        /* Prefer an unshared context when we will read back anyway: sharing can fail silently on ANGLE/iOS. */
++        if (force_rb) {
++            c->c = createContext(E2.dpy, E2.cfg, NULL, attr);
++            c->readback = c->c != NULL;
++        } else {
++            c->c = createContext(E2.dpy, E2.cfg, share && share->c ? share->c : E2.ui, attr);
++            if (!c->c) { c->c = createContext(E2.dpy, E2.cfg, share && share->c ? share->c : NULL, attr); c->readback = c->c != NULL; }
++        }
+         if (!c->c && v == 1) v = 2;
+     }
+     if (!c->c) { tl_log_line("egl: no ES %d context for the app's thread", v); free(c); return true; }
+     c->version = v;
+-    tl_log_line("egl: the app made an ES %d context on its own thread%s", v, c->readback ? " (frames read back)" : "");
++    if (force_rb) c->readback = true;
++    tl_log_line("egl: the app made an ES %d context on its own thread%s%s", v,
++                c->readback ? " (frames read back)" : "",
++                force_rb ? " [hoc/gameloft]" : "");
+     ret->j = (int64_t)(uintptr_t)c;
+     return true;
+ }
+@@ -1005,10 +1025,14 @@ static void *gl_main(void *arg)
+         uint64_t q = app_frame_seq();
+         bool app_fresh = q != app_seq;
+         app_seq = q;
++        /* App-copied GLSurfaceView (Gameloft GL2JNI / HuskEGL pbuffer) publishes frames via EN_swap into E2.
++         * Those must be composited even if a framework GLSurfaceView also called startGL (LogoView, ads, …):
++         * previously app_frame_draw ran only when !app, which left HOC black after the logo. */
+         if (drew || fresh || app_fresh) {
+             makeCurrent(dpy, surf, surf, ui);
+             if (!app) { clearColor(0, 0, 0, tl_web_any_visible() && !app_frame_on() ? 0 : 1); clear(0x4000); }     /* web views show through from under the screen */
+-            if (!app) app_frame_draw(&appov, &appup, A.cfg.width, A.cfg.height);
++            else if (app_frame_on()) { /* keep the framework GL frame, then overlay the app-thread pbuffer */ }
++            app_frame_draw(&appov, &appup, A.cfg.width, A.cfg.height);
+             if (tl_ui_has_frame()) ov_draw(&ov, A.cfg.width, A.cfg.height);
+             swapBuffers(dpy, surf);
+             atomic_fetch_add(&A.frames, 1);

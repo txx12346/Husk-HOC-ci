@@ -1,0 +1,17 @@
+只上传这几个文件到 GitHub 新仓库（浏览器即可，不用 gh）：
+
+1. 打开 https://github.com/new
+2. Repository name: Husk-HOC-ci
+3. Public，不要勾选 README
+4. Create repository
+5. 点 “uploading an existing file”
+6. 把本文件夹里这些拖进去（保持目录结构）：
+   - .github/workflows/husk-hoc-ipa.yml
+   - scripts/ci_prepare_hoc.sh
+   - patches/hoc-and-ci.patch
+   - README.md
+7. Commit changes
+8. Actions → Husk HOC IPA → Run workflow
+9. 完成后下载 Artifact: Husk-HOC-ipa
+
+真机用 Sideloadly 安装，用外部 StikDebug 开 JIT。
